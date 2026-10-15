@@ -13,6 +13,36 @@ const path = require('path');
 
 const DEFAULT_HOST = process.env.SEESTAR_HOST || '192.168.8.24';
 const DEFAULT_KEY = process.env.SEESTAR_KEY_PATH || path.join(__dirname, 'seestar.pem');
+const LAST_PLAN_PATH = path.join(__dirname, '.cache', 'last-view-plan.json');
+const RETRYABLE_COMMANDS = new Set(['status', 'state', 'summary', 'health', 'time', 'plan-status']);
+
+const pause = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+
+function planSignature(plan) {
+  return {
+    name: plan?.plan_name || null,
+    targets: (plan?.list || []).map(item => ({
+      name: item.target_name,
+      startMinute: item.start_min,
+      durationMinutes: item.duration_min,
+      mosaicScale: item.mosaic?.scale || null,
+    })),
+  };
+}
+
+function saveLastPlan(plan) {
+  fs.mkdirSync(path.dirname(LAST_PLAN_PATH), { recursive: true });
+  fs.writeFileSync(LAST_PLAN_PATH, JSON.stringify(planSignature(plan), null, 2));
+}
+
+function lastPlanMatches(activePlan) {
+  if (!fs.existsSync(LAST_PLAN_PATH)) return null;
+  try {
+    return JSON.stringify(JSON.parse(fs.readFileSync(LAST_PLAN_PATH, 'utf8'))) === JSON.stringify(planSignature(activePlan));
+  } catch {
+    return null;
+  }
+}
 
 function usage(exitCode = 0) {
   console.log(`
@@ -22,9 +52,16 @@ Usage:
   node seestar.js status [host]
   node seestar.js state [host]
   node seestar.js summary [host]
+  node seestar.js health [host]
   node seestar.js goto <name> <ra-hours> <dec-deg> [host]
   node seestar.js mosaic <name> <ra-hours> <dec-deg> <scale> <angle-deg> [host]
   node seestar.js exposure <seconds> [host]
+  node seestar.js set-time [host]
+  node seestar.js time [host]
+  node seestar.js plan-settings [host]
+  node seestar.js plan-status [host]
+  node seestar.js plan <plan-json-file> [host]
+  node seestar.js clear-plan [host]
   node seestar.js stack [host]
   node seestar.js stop [host]
   node seestar.js park [host]
@@ -57,9 +94,19 @@ class SeeStarClient {
   connect() {
     return new Promise((resolve, reject) => {
       this.socket = net.createConnection({ host: this.host, port: 4700 });
+      this.socket.setKeepAlive(true, 10_000);
       this.socket.setTimeout(20_000);
       this.socket.on('timeout', () => reject(new Error('Connection timed out.')));
-      this.socket.on('error', reject);
+      this.socket.on('error', error => {
+        for (const waiter of this.pending.values()) waiter.reject(error);
+        this.pending.clear();
+        reject(error);
+      });
+      this.socket.on('close', () => {
+        const error = new Error('Connection to the telescope closed.');
+        for (const waiter of this.pending.values()) waiter.reject(error);
+        this.pending.clear();
+      });
       this.socket.on('data', chunk => this.onData(chunk));
       this.socket.on('connect', resolve);
     });
@@ -94,7 +141,14 @@ class SeeStarClient {
       }, 20_000);
       this.pending.set(id, {
         resolve: message => { clearTimeout(timer); resolve(message); },
+        reject: error => { clearTimeout(timer); reject(error); },
       });
+      if (!this.socket?.writable) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(new Error('Connection to the telescope is not writable.'));
+        return;
+      }
       this.socket.write(`${JSON.stringify(payload)}\r\n`);
     });
   }
@@ -142,6 +196,10 @@ async function run() {
       host = args[0] || host;
       method = 'iscope_get_app_state';
       break;
+    case 'health':
+      host = args[0] || host;
+      method = 'get_device_state';
+      break;
     case 'goto': {
       const [name, ra, dec, suppliedHost] = args;
       if (!name || Number.isNaN(Number(ra)) || Number.isNaN(Number(dec))) usage(1);
@@ -173,6 +231,37 @@ async function run() {
       params = { expert_mode: true, exp_ms: { stack_l: milliseconds, continuous: 500 } };
       break;
     }
+    case 'set-time':
+      host = args[0] || host;
+      method = 'pi_set_time';
+      params = { timestamp: Math.floor(Date.now() / 1000) };
+      break;
+    case 'time':
+      host = args[0] || host;
+      method = 'pi_get_time';
+      break;
+    case 'plan-settings':
+      host = args[0] || host;
+      method = 'set_setting';
+      params = { plan_target_af: true, viewplan_gohome: true };
+      break;
+    case 'plan-status':
+      host = args[0] || host;
+      method = 'iscope_get_app_state';
+      break;
+    case 'plan': {
+      const [planFile, suppliedHost] = args;
+      if (!planFile) usage(1);
+      host = suppliedHost || host;
+      params = JSON.parse(fs.readFileSync(planFile, 'utf8'));
+      if (!params.plan_name || !Array.isArray(params.list) || params.list.length === 0) throw new Error('Plan file must contain a name and at least one target.');
+      method = 'set_view_plan';
+      break;
+    }
+    case 'clear-plan':
+      host = args[0] || host;
+      method = 'clear_view_plan';
+      break;
     case 'stack':
       host = args[0] || host;
       method = 'iscope_start_stack';
@@ -191,22 +280,57 @@ async function run() {
       usage(1);
   }
 
-  const client = new SeeStarClient(host, DEFAULT_KEY);
-  try {
-    await client.connect();
-    await client.authenticate();
-    const reply = await client.send(method, params);
-    if (reply.code !== 0) throw new Error(reply.error || `Telescope returned code ${reply.code}.`);
-    if (command === 'summary') {
-      const view = reply.result?.View || {};
-      console.log(JSON.stringify({
-        state: view.state, stage: view.stage, target: view.target_name, coordinates: view.target_ra_dec,
-        stack: view.Stack ? { state: view.Stack.state, accepted: view.Stack.stacked_frame, dropped: view.Stack.dropped_frame, exposureMs: view.Stack.Exposure?.exp_ms } : null,
-      }, null, 2));
-    } else console.log(JSON.stringify(cleanResult(reply.result), null, 2));
-  } finally {
-    client.close();
+  const sendOnce = async () => {
+    const client = new SeeStarClient(host, DEFAULT_KEY);
+    try {
+      await client.connect();
+      await client.authenticate();
+      const reply = await client.send(method, params);
+      if (reply.code !== 0) throw new Error(reply.error || `Telescope returned code ${reply.code}.`);
+      return reply;
+    } finally {
+      client.close();
+    }
+  };
+
+  let reply;
+  let lastError;
+  const attempts = RETRYABLE_COMMANDS.has(command) ? 3 : 1;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      reply = await sendOnce();
+      break;
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) await pause(attempt * 1_000);
+    }
   }
+  if (!reply) throw lastError;
+
+  if (command === 'plan') saveLastPlan(params);
+  if (command === 'plan-status') {
+    const viewPlan = reply.result?.ViewPlan || {};
+    const plan = viewPlan.plan || {};
+    const configurationMatchesLastUpload = lastPlanMatches(plan);
+    console.log(JSON.stringify({
+      state: viewPlan.state, plan: plan.plan_name,
+      configurationMatchesLastUpload,
+      configurationWarning: configurationMatchesLastUpload === false ? 'The telescope returned a plan different from the last plan uploaded by this controller.' : undefined,
+      targets: (plan.list || []).map(item => ({ name: item.target_name, startMinute: item.start_min, durationMinutes: item.duration_min, state: item.state || 'pending' })),
+    }, null, 2));
+  } else if (command === 'summary') {
+    const view = reply.result?.View || {};
+    console.log(JSON.stringify({
+      state: view.state, stage: view.stage, target: view.target_name, coordinates: view.target_ra_dec,
+      stack: view.Stack ? { state: view.Stack.state, accepted: view.Stack.stacked_frame, dropped: view.Stack.dropped_frame, exposureMs: view.Stack.Exposure?.exp_ms } : null,
+    }, null, 2));
+  } else if (command === 'health') {
+    const device = reply.result || {}; const pi = device.pi_status || {};
+    console.log(JSON.stringify({
+      model: device.device?.product_model, firmware: device.device?.firmware_ver_string,
+      battery: pi.battery_capacity, charging: pi.charge_online, temperatureC: pi.temp, overheating: pi.is_overtemp,
+    }, null, 2));
+  } else console.log(JSON.stringify(cleanResult(reply.result), null, 2));
 }
 
 run().catch(error => {

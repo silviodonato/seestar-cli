@@ -1,0 +1,4 @@
+# Device credential and local controller state
+seestar.pem
+.cache/
+.deps/
